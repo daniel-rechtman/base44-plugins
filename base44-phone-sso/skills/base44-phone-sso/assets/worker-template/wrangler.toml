@@ -1,0 +1,42 @@
+name = "phone-oidc"
+main = "src/index.js"
+compatibility_date = "2025-05-01"
+
+# ---------------------------------------------------------------------------
+# KV namespace. A single namespace is used with key prefixes:
+#   otp:<phone>      OTP records         (TTL 300s)
+#   authcode:<code>  authorization codes (TTL 300s)
+#   at:<token>       access tokens       (TTL 3600s)
+#   rl:<phone>       OTP send rate limit (TTL 900s)
+# Create it with:  wrangler kv namespace create OIDC_KV
+# then paste the printed "id" below.
+# ---------------------------------------------------------------------------
+[[kv_namespaces]]
+binding = "OIDC_KV"
+id = "__KV_NAMESPACE_ID__"
+
+# ---------------------------------------------------------------------------
+# Non-secret config (safe to commit). Secrets (GREEN_API_TOKEN,
+# OIDC_PRIVATE_KEY, OIDC_CLIENT_SECRET, GREEN_API_ID, OIDC_CLIENT_ID,
+# BASE44_API_KEY) are set via `wrangler secret put` and never appear here.
+# ---------------------------------------------------------------------------
+[vars]
+# Must match the published JWK. Printed by `npm run keygen` and stored in KEYS.local.json.
+OIDC_KID = "__OIDC_KID__"
+
+# The ONE redirect_uri the Worker will accept. It is your Base44 app's SSO callback:
+#   https://app.base44.com/api/apps/<YOUR_BASE44_APP_ID>/auth/sso/callback
+ALLOWED_REDIRECT_URI = "https://app.base44.com/api/apps/__BASE44_APP_ID__/auth/sso/callback"
+
+# Your Base44 app id (used to read the AuthorizedPhone allowlist entity).
+BASE44_APP_ID = "__BASE44_APP_ID__"
+
+# Shown on the login screen and inside the WhatsApp OTP message.
+APP_NAME = "My App"
+
+# Optional. The synthetic email domain handed to Base44 (users never see it).
+# Defaults to the Worker's own host, which is stable per deployment.
+# SYNTHETIC_EMAIL_DOMAIN = "phone.example.com"
+
+# Optional. Only set if you put a custom domain in front of the Worker.
+# ISSUER = "https://auth.example.com"

@@ -1,0 +1,17 @@
+{
+  "name": "phone-oidc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted OpenID Connect provider on Cloudflare Workers. Authenticates users by phone number with an OTP delivered over WhatsApp via the Green API. For use as a Base44 Advanced/Manual SSO (OIDC) provider.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "keygen": "node scripts/generate-keys.mjs",
+    "check": "node --check src/index.js"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

@@ -1,0 +1,15 @@
+# Secrets — never commit
+KEYS.local.json
+secrets.json
+*.local.json
+.dev.vars
+.env
+.env.*
+
+# Wrangler / Cloudflare
+.wrangler/
+wrangler.toml.bak
+
+# Node
+node_modules/
+npm-debug.log*

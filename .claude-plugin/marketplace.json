@@ -1,0 +1,18 @@
+{
+  "name": "base44-plugins",
+  "owner": {
+    "name": "Daniel Rechtman",
+    "url": "https://github.com/daniel-rechtman"
+  },
+  "metadata": {
+    "description": "Claude Code plugins for Base44 builders, by Daniel Rechtman."
+  },
+  "plugins": [
+    {
+      "name": "base44-phone-sso",
+      "source": "./base44-phone-sso",
+      "description": "Set up phone-number login (WhatsApp OTP via Green API) for a Base44 app, end-to-end. Deploys a self-hosted OIDC provider on Cloudflare, connects it to Base44 SSO, and adds an in-app allowlist of approved numbers.",
+      "version": "1.0.0"
+    }
+  ]
+}
