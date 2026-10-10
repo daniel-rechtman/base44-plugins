@@ -1,926 +1,496 @@
-/**
- * MeetVault Phone OIDC Identity Provider — Cloudflare Worker
- * =========================================================
- *
- * A self-hosted OpenID Connect (OIDC) provider that authenticates users by
- * their phone number. A 6-digit OTP is delivered over WhatsApp via the
- * Green API. The phone number IS the user identity.
- *
- * Designed to be plugged into a Base44 app as an "Advanced / Manual" SSO
- * (OIDC) provider using the authorization-code flow (confidential client),
- * with optional PKCE (S256).
- *
- * Endpoints:
- *   GET  /.well-known/openid-configuration   discovery document
- *   GET  /authorize                          phone + OTP login UI (RTL Hebrew)
- *   POST /authorize/send                     (internal) send OTP via WhatsApp
- *   POST /authorize/verify                   (internal) verify OTP -> issue code
- *   POST /token                              exchange code for tokens
- *   GET  /userinfo                           Bearer access_token -> claims
- *   GET  /jwks  and  /.well-known/jwks.json  public RSA JWK set
- *
- * Required environment (Worker secrets / vars):
- *   GREEN_API_ID            Green API idInstance
- *   GREEN_API_TOKEN         Green API apiTokenInstance
- *   OIDC_CLIENT_ID          the single allowed client_id
- *   OIDC_CLIENT_SECRET      the matching client_secret
- *   OIDC_PRIVATE_KEY        RSA-2048 private key, PKCS8 PEM
- *   OIDC_KID                key id matching the published JWK
- *   ALLOWED_REDIRECT_URI    the single allowed redirect_uri
- *   ISSUER                  (optional) override issuer origin
- *
- * KV bindings:
- *   OIDC_KV   single namespace, key prefixes used:
- *               otp:<phone>        -> { code, attempts, expiresAt }   TTL 300s
- *               authcode:<code>    -> { phone, client_id, redirect_uri,
- *                                       nonce, code_challenge, ... }  TTL 300s
- *               at:<token>         -> { phone }                       TTL 3600s
- *               rl:<phone>         -> request count (sliding window)  TTL 900s
- */
+// index.js - a minimal OIDC identity provider that verifies a phone number with
+// a one-time code on WhatsApp and hands Base44 a stable email for it.
+//
+// Why this exists: Base44 SSO only accepts standard OIDC providers and keys
+// every user by email. A phone-only user has no email, so off-the-shelf
+// providers fail with "Email not returned by OAuth provider". This Worker
+// derives <phone>@<domain>, so the same phone always lands on the same user.
+//
+// Flow:
+//   Base44 -> GET  /authorize          (stores the OIDC request in KV, serves the page)
+//             POST /authorize/send     (allowlist -> OTP -> WhatsApp)
+//             POST /authorize/verify   (check code -> authorization code -> back to Base44)
+//   Base44 -> POST /token              (authorization code -> RS256-signed id_token)
+//
+// Guiding rule: everything the browser sends is hostile. The OIDC request is
+// stored server-side under a one-time sid and is never read back from a POST.
 
-// ---------------------------------------------------------------------------
-// Configuration constants
-// ---------------------------------------------------------------------------
-const OTP_TTL_SECONDS = 300;          // OTP valid for 5 minutes
-const CODE_TTL_SECONDS = 300;         // auth code valid for 5 minutes
-const ACCESS_TOKEN_TTL_SECONDS = 3600; // access token / id_token valid 1 hour
-const MAX_OTP_VERIFY_ATTEMPTS = 5;    // wrong-code attempts before lockout
-const RL_MAX_SENDS = 5;               // max OTP sends...
-const RL_WINDOW_SECONDS = 900;        // ...per 15 minutes per phone
-const SCOPES_SUPPORTED = ["openid", "profile", "email", "phone"];
+import { signJwt, sha256Hex, timingSafeEqual, randomDigits, randomToken, s256Challenge } from "./crypto.js";
+import { normalizePhone } from "./phone.js";
+import { sendOtp } from "./otp.js";
+import { isPhoneAuthorized } from "./allowlist.js";
+import { ensureBase44User, completeUserProfile, logLoginAttempt } from "./provision.js";
+import { loginPage, errorPage } from "./page.js";
+import { messages } from "./messages.js";
 
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
+const OTP_LENGTH = 6;
+const OTP_TTL_SEC = 300;              // 5 minutes
+const OTP_MAX_ATTEMPTS = 5;
+const OTP_RESEND_COOLDOWN_SEC = 45;   // tune with OTP_RESEND_COOLDOWN
+const AUTH_REQ_TTL_SEC = 900;         // 15 minutes to finish a login
+const AUTH_CODE_TTL_SEC = 120;
+const ID_TOKEN_TTL_SEC = 3600;
+// Rate limits, tunable without a code change. They exist so nobody can flood a
+// person with codes (harassment + cost), not to make testing painful.
+const SEND_LIMIT_PER_PHONE_PER_HOUR = 5;
+const SEND_LIMIT_PER_IP_PER_HOUR = 20;
+const numEnv = (env, key, fallback) => {
+  const n = Number(env[key]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
 
-/** JSON Response helper. */
-function json(data, status = 200, extraHeaders = {}) {
-  return new Response(JSON.stringify(data), {
+const json = (data, status = 200) =>
+  new Response(JSON.stringify(data), {
     status,
-    headers: {
-      "content-type": "application/json;charset=UTF-8",
-      "cache-control": "no-store",
-      ...extraHeaders,
-    },
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
   });
-}
 
-/** HTML Response helper. */
-function html(body, status = 200) {
-  return new Response(body, {
+const html = (body, status = 200) =>
+  new Response(body, {
     status,
-    headers: {
-      "content-type": "text/html;charset=UTF-8",
-      "cache-control": "no-store",
-    },
-  });
-}
-
-/** OAuth-style error redirect or JSON. */
-function oauthError(error, description, status = 400) {
-  return json({ error, error_description: description }, status);
-}
-
-/** base64url encode an ArrayBuffer or Uint8Array. */
-function base64urlFromBytes(bytes) {
-  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  let bin = "";
-  for (let i = 0; i < arr.length; i++) bin += String.fromCharCode(arr[i]);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-/** base64url encode a UTF-8 string. */
-function base64url(str) {
-  return base64urlFromBytes(new TextEncoder().encode(str));
-}
-
-/** Cryptographically random token, base64url. */
-function randomToken(byteLen = 32) {
-  const b = new Uint8Array(byteLen);
-  crypto.getRandomValues(b);
-  return base64urlFromBytes(b);
-}
-
-/** Generate a numeric OTP of given length (default 6). */
-function generateOtp(len = 6) {
-  const digits = new Uint32Array(len);
-  crypto.getRandomValues(digits);
-  let out = "";
-  for (let i = 0; i < len; i++) out += (digits[i] % 10).toString();
-  return out;
-}
-
-/** Constant-time string comparison (mitigates timing attacks). */
-function timingSafeEqual(a, b) {
-  const ab = new TextEncoder().encode(String(a));
-  const bb = new TextEncoder().encode(String(b));
-  // Always compare to a fixed-length buffer to avoid leaking length cheaply.
-  const len = Math.max(ab.length, bb.length);
-  let diff = ab.length ^ bb.length;
-  for (let i = 0; i < len; i++) {
-    diff |= (ab[i] || 0) ^ (bb[i] || 0);
-  }
-  return diff === 0;
-}
-
-/**
- * Normalize a phone number to E.164 digits without "+", defaulting to Israel.
- * Accepts forms like: 0501234567, 050-123-4567, +972501234567, 972501234567,
- * 972-52-540-3226. Returns null if it cannot produce a plausible number.
- */
-function normalizePhone(raw, defaultCountry = "972") {
-  if (!raw) return null;
-  // Keep leading + marker, strip everything else that is not a digit.
-  let s = String(raw).trim();
-  const hadPlus = s.startsWith("+") || s.startsWith("00");
-  s = s.replace(/[^\d]/g, "");
-  if (!s) return null;
-
-  if (s.startsWith("00")) s = s.slice(2); // 00 prefix -> international
-
-  if (hadPlus) {
-    // Already international; just return digits.
-    return s.length >= 8 && s.length <= 15 ? s : null;
-  }
-
-  // Israel local handling: leading 0 means local subscriber number.
-  if (s.startsWith("0")) {
-    return defaultCountry + s.slice(1);
-  }
-
-  // Already starts with country code (e.g. 972...) — accept as-is.
-  if (s.startsWith(defaultCountry)) {
-    return s.length >= 11 && s.length <= 15 ? s : null;
-  }
-
-  // Bare local number without leading 0 (e.g. 501234567) -> prepend country.
-  if (s.length >= 8 && s.length <= 10) {
-    return defaultCountry + s;
-  }
-
-  // Otherwise assume it's already a full international number.
-  return s.length >= 11 && s.length <= 15 ? s : null;
-}
-
-/** Pretty +E.164 form for display/claims, e.g. "+972501234567". */
-function toPlusForm(e164digits) {
-  return "+" + e164digits;
-}
-
-/** Compute the issuer origin from the request, allowing ISSUER override. */
-function issuerOf(request, env) {
-  if (env.ISSUER) return env.ISSUER.replace(/\/+$/, "");
-  const url = new URL(request.url);
-  return `${url.protocol}//${url.host}`;
-}
-
-// ---------------------------------------------------------------------------
-// JWT signing (RS256) using Web Crypto
-// ---------------------------------------------------------------------------
-
-/** Parse a PKCS8 PEM string into an ArrayBuffer of the DER body. */
-function pemToArrayBuffer(pem) {
-  const b64 = pem
-    .replace(/-----BEGIN [^-]+-----/g, "")
-    .replace(/-----END [^-]+-----/g, "")
-    .replace(/\s+/g, "");
-  const bin = atob(b64);
-  const buf = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-  return buf.buffer;
-}
-
-let _cachedKey = null;
-/** Import the RSA private key for RS256 signing (cached per isolate). */
-async function importPrivateKey(pem) {
-  if (_cachedKey) return _cachedKey;
-  const keyData = pemToArrayBuffer(pem);
-  _cachedKey = await crypto.subtle.importKey(
-    "pkcs8",
-    keyData,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-  return _cachedKey;
-}
-
-/** Sign a JWT (RS256). header/payload are plain objects. */
-async function signJwt(header, payload, privateKeyPem) {
-  const key = await importPrivateKey(privateKeyPem);
-  const headerB64 = base64url(JSON.stringify(header));
-  const payloadB64 = base64url(JSON.stringify(payload));
-  const signingInput = `${headerB64}.${payloadB64}`;
-  const sig = await crypto.subtle.sign(
-    { name: "RSASSA-PKCS1-v1_5" },
-    key,
-    new TextEncoder().encode(signingInput)
-  );
-  return `${signingInput}.${base64urlFromBytes(sig)}`;
-}
-
-/**
- * Build the public JWK from the private key PEM at runtime, so the JWKS
- * endpoint always matches the signing key. Cached per isolate.
- */
-let _cachedJwk = null;
-async function publicJwkFromPrivate(pem, kid) {
-  if (_cachedJwk) return _cachedJwk;
-  const keyData = pemToArrayBuffer(pem);
-  // Import as a key we can export the public JWK from.
-  const priv = await crypto.subtle.importKey(
-    "pkcs8",
-    keyData,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    true,
-    ["sign"]
-  );
-  const fullJwk = await crypto.subtle.exportKey("jwk", priv);
-  // Keep only the public components.
-  _cachedJwk = {
-    kty: fullJwk.kty,
-    n: fullJwk.n,
-    e: fullJwk.e,
-    alg: "RS256",
-    use: "sig",
-    kid,
-  };
-  return _cachedJwk;
-}
-
-// ---------------------------------------------------------------------------
-// PKCE
-// ---------------------------------------------------------------------------
-
-/** Verify a PKCE code_verifier against a stored S256 code_challenge. */
-async function verifyPkce(codeVerifier, codeChallenge) {
-  if (!codeChallenge) return true; // no PKCE was used
-  if (!codeVerifier) return false;
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(codeVerifier)
-  );
-  return timingSafeEqual(base64urlFromBytes(digest), codeChallenge);
-}
-
-// ---------------------------------------------------------------------------
-// Green API — send WhatsApp message
-// ---------------------------------------------------------------------------
-
-async function sendWhatsAppOtp(env, phoneDigits, code) {
-  const url = `https://api.green-api.com/waInstance${env.GREEN_API_ID}/sendMessage/${env.GREEN_API_TOKEN}`;
-  const message =
-    `קוד האימות שלך הוא: ${code}\n` +
-    `הקוד תקף ל-5 דקות. אל תשתף אותו עם אף אחד.\n\n` +
-    `${env.APP_NAME || "Phone Login"}`;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chatId: `${phoneDigits}@c.us`, message }),
-  });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(`Green API send failed: ${resp.status} ${text}`);
-  }
-  return resp.json().catch(() => ({}));
-}
-
-// ---------------------------------------------------------------------------
-// Client / request validation
-// ---------------------------------------------------------------------------
-
-function validateClientId(env, clientId) {
-  return typeof clientId === "string" && timingSafeEqual(clientId, env.OIDC_CLIENT_ID);
-}
-
-function validateRedirectUri(env, redirectUri) {
-  return typeof redirectUri === "string" && redirectUri === env.ALLOWED_REDIRECT_URI;
-}
-
-/**
- * Authorization gate: is this phone allowed to log in?
- * Queries the Base44 `AuthorizedPhone` entity (managed from inside the app).
- * - If enforcement is NOT configured (no BASE44_API_KEY / BASE44_APP_ID),
- *   allow everyone (backwards compatible).
- * - If enforcement IS configured, FAIL CLOSED: deny on lookup error, on a
- *   missing record, or when the record's `approved` is explicitly false.
- * phone is the normalized E.164-without-plus form (e.g. "972501234567").
- */
-async function isPhoneAuthorized(env, phone) {
-  if (!env.BASE44_API_KEY || !env.BASE44_APP_ID) return true; // enforcement off
-  const base = (env.BASE44_API_URL || "https://app.base44.com").replace(/\/+$/, "");
-  // Fetch the whole (small) allowlist and compare on the NORMALIZED phone, so a
-  // record stored in any format (0501234567 / 501234567 / +972... / 972...)
-  // still matches the normalized login input. We do NOT filter server-side by
-  // the exact string, because the stored string may be in a different format.
-  const url =
-    `${base}/api/apps/${env.BASE44_APP_ID}/entities/AuthorizedPhone?limit=1000`;
-  let resp;
-  try {
-    resp = await fetch(url, {
-      headers: { api_key: env.BASE44_API_KEY, accept: "application/json" },
-    });
-  } catch (e) {
-    return false; // network error -> fail closed
-  }
-  if (!resp.ok) return false;
-  let data;
-  try {
-    data = await resp.json();
-  } catch (e) {
-    return false;
-  }
-  const list = Array.isArray(data)
-    ? data
-    : data.results || data.data || data.items || [];
-  // Normalize BOTH sides before comparing; require approved !== false.
-  return list.some(
-    (r) => normalizePhone(r.phone) === phone && r.approved !== false
-  );
-}
-
-// ---------------------------------------------------------------------------
-// HTML login page (RTL Hebrew)
-// ---------------------------------------------------------------------------
-
-/**
- * Renders the single-page login UI. Step 1 (phone) and Step 2 (OTP) are both
- * present in the DOM; JavaScript toggles between them and talks to the
- * /authorize/send and /authorize/verify endpoints via fetch. The original
- * OIDC params are carried in a hidden form payload.
- */
-function loginPage(params, appName = "Phone Login") {
-  // params is a plain object of the validated query params; embed as JSON.
-  const paramsJson = JSON.stringify(params).replace(/</g, "\\u003c");
-  return `<!DOCTYPE html>
-<html lang="he" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>כניסה ל-${appName}</title>
-<style>
-  :root {
-    --bg: #0b1020;
-    --card: #151b2e;
-    --accent: #4f8cff;
-    --accent-2: #25d366;
-    --text: #eef2ff;
-    --muted: #9aa4c7;
-    --err: #ff6b6b;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center;
-    justify-content: center;
-    background: linear-gradient(160deg, #0b1020, #131a30 60%, #0b1020);
-    font-family: -apple-system, "Segoe UI", "Heebo", Arial, sans-serif;
-    color: var(--text); padding: 20px;
-  }
-  .card {
-    width: 100%; max-width: 400px; background: var(--card);
-    border: 1px solid rgba(255,255,255,0.06); border-radius: 20px;
-    padding: 32px 28px; box-shadow: 0 20px 60px rgba(0,0,0,0.5);
-  }
-  .logo { font-size: 26px; font-weight: 800; text-align: center; margin-bottom: 6px;
-          background: linear-gradient(90deg, var(--accent), var(--accent-2));
-          -webkit-background-clip: text; background-clip: text; color: transparent; }
-  .sub { text-align: center; color: var(--muted); font-size: 14px; margin-bottom: 26px; }
-  label { display: block; font-size: 13px; color: var(--muted); margin: 0 0 8px 2px; }
-  .row { display: flex; gap: 8px; }
-  .cc {
-    background: #0e1426; border: 1px solid rgba(255,255,255,0.08); color: var(--text);
-    border-radius: 12px; padding: 0 12px; display: flex; align-items: center;
-    font-size: 16px; min-width: 78px; justify-content: center;
-  }
-  input[type=tel], input[type=text] {
-    width: 100%; background: #0e1426; border: 1px solid rgba(255,255,255,0.08);
-    color: var(--text); border-radius: 12px; padding: 14px 14px; font-size: 18px;
-    outline: none; transition: border-color .15s; direction: ltr; text-align: left;
-  }
-  input:focus { border-color: var(--accent); }
-  .otp-input { letter-spacing: 10px; text-align: center; font-size: 26px; }
-  button {
-    width: 100%; margin-top: 18px; padding: 14px; border: 0; border-radius: 12px;
-    font-size: 16px; font-weight: 700; color: #06122a; cursor: pointer;
-    background: linear-gradient(90deg, var(--accent), #6fa8ff); transition: opacity .15s;
-  }
-  button:hover { opacity: .92; }
-  button:disabled { opacity: .5; cursor: default; }
-  .msg { margin-top: 14px; font-size: 13px; text-align: center; min-height: 18px; }
-  .msg.err { color: var(--err); }
-  .msg.ok { color: var(--accent-2); }
-  .hidden { display: none; }
-  .back { background: none; color: var(--muted); font-weight: 500; margin-top: 10px; padding: 6px; }
-  .foot { text-align: center; color: var(--muted); font-size: 11px; margin-top: 22px; }
-  .wa { color: var(--accent-2); }
-</style>
-</head>
-<body>
-  <div class="card">
-    <div class="logo">${appName}</div>
-    <div class="sub">התחברות מאובטחת באמצעות מספר הטלפון</div>
-
-    <!-- Step 1: phone -->
-    <div id="step-phone">
-      <label for="phone">מספר טלפון</label>
-      <div class="row">
-        <div class="cc">+972</div>
-        <input id="phone" type="tel" inputmode="numeric" autocomplete="tel"
-               placeholder="050-000-0000" maxlength="15" />
-      </div>
-      <button id="sendBtn">שלח קוד ב-<span class="wa">WhatsApp</span></button>
-      <div id="msg1" class="msg"></div>
-    </div>
-
-    <!-- Step 2: OTP -->
-    <div id="step-otp" class="hidden">
-      <label for="otp">הקלד את הקוד שקיבלת ב-WhatsApp</label>
-      <input id="otp" class="otp-input" type="text" inputmode="numeric"
-             autocomplete="one-time-code" placeholder="------" maxlength="6" />
-      <button id="verifyBtn">אימות והתחברות</button>
-      <button id="backBtn" class="back">חזרה לשינוי המספר</button>
-      <div id="msg2" class="msg"></div>
-    </div>
-
-    <div class="foot">הקוד נשלח לוואטסאפ. תקף ל-5 דקות.</div>
-  </div>
-
-<script>
-  const PARAMS = ${paramsJson};
-  const $ = (id) => document.getElementById(id);
-  let currentPhone = "";
-
-  function setMsg(el, text, kind) {
-    el.textContent = text || "";
-    el.className = "msg" + (kind ? " " + kind : "");
-  }
-
-  async function postForm(path, data) {
-    const body = new URLSearchParams();
-    for (const k in data) body.append(k, data[k]);
-    const r = await fetch(path, { method: "POST", body });
-    let j = {};
-    try { j = await r.json(); } catch (e) {}
-    return { ok: r.ok, status: r.status, body: j };
-  }
-
-  // Step 1: send OTP
-  $("sendBtn").addEventListener("click", async () => {
-    const phone = $("phone").value.trim();
-    if (!phone) { setMsg($("msg1"), "נא להזין מספר טלפון", "err"); return; }
-    $("sendBtn").disabled = true;
-    setMsg($("msg1"), "שולח קוד...", "");
-    const res = await postForm("/authorize/send", { phone, client_id: PARAMS.client_id });
-    $("sendBtn").disabled = false;
-    if (!res.ok) {
-      setMsg($("msg1"), res.body.error_description || "שליחת הקוד נכשלה. נסה שוב.", "err");
-      return;
-    }
-    currentPhone = res.body.phone;
-    $("step-phone").classList.add("hidden");
-    $("step-otp").classList.remove("hidden");
-    setMsg($("msg2"), "קוד נשלח אל " + res.body.display, "ok");
-    $("otp").focus();
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
   });
 
-  // Step 2: verify OTP -> server returns a redirect URL we navigate to.
-  $("verifyBtn").addEventListener("click", async () => {
-    const code = $("otp").value.trim();
-    if (code.length < 6) { setMsg($("msg2"), "הקוד חייב להכיל 6 ספרות", "err"); return; }
-    $("verifyBtn").disabled = true;
-    setMsg($("msg2"), "מאמת...", "");
-    const payload = Object.assign({ phone: currentPhone, code }, PARAMS);
-    const res = await postForm("/authorize/verify", payload);
-    if (res.ok && res.body.redirect) {
-      window.location.href = res.body.redirect;
-      return;
-    }
-    $("verifyBtn").disabled = false;
-    setMsg($("msg2"), res.body.error_description || "קוד שגוי. נסה שוב.", "err");
-  });
-
-  $("backBtn").addEventListener("click", () => {
-    $("step-otp").classList.add("hidden");
-    $("step-phone").classList.remove("hidden");
-    setMsg($("msg1"), "", "");
-    $("otp").value = "";
-  });
-
-  // Enter-key convenience
-  $("phone").addEventListener("keydown", (e) => { if (e.key === "Enter") $("sendBtn").click(); });
-  $("otp").addEventListener("keydown", (e) => { if (e.key === "Enter") $("verifyBtn").click(); });
-</script>
-</body>
-</html>`;
+function issuerOf(env, url) {
+  return (env.ISSUER || `${url.protocol}//${url.host}`).replace(/\/$/, "");
 }
 
-// ---------------------------------------------------------------------------
-// Route handlers
-// ---------------------------------------------------------------------------
+function allowedRedirectUris(env) {
+  return String(env.ALLOWED_REDIRECT_URIS || "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+}
 
-/** GET /.well-known/openid-configuration */
-function handleDiscovery(request, env) {
-  const iss = issuerOf(request, env);
-  return json({
+// THE DOMAIN OF THE DERIVED EMAIL IS EVERY USER'S IDENTITY. Set
+// SYNTHETIC_EMAIL_DOMAIN once, before the first real login, and never touch it
+// again. Unset (or still the template placeholder), it falls back to this
+// Worker's host name, which is what version 1 of this template did; that keeps
+// an upgraded deployment on the same identities, but it also means renaming
+// the Worker or moving it to another domain would change them. Set it explicitly.
+function syntheticEmail(env, phone, url) {
+  const configured = String(env.SYNTHETIC_EMAIL_DOMAIN || "");
+  const domain = configured && !configured.startsWith("__") ? configured : new URL(issuerOf(env, url)).host;
+  return `${phone}@${domain}`;
+}
+
+// ---------- trusted proxy (login page served from the app's own domain) ----------
+// Why: networks and devices with content filtering often block *.workers.dev
+// and show a blank page, which looks like a "login loop". A backend function
+// in the Base44 app can serve /authorize + send + verify from the app's domain
+// and forward to this Worker (assets/base44-functions/phoneLogin). It proves
+// itself with a shared secret, and only then do we accept from it the real
+// client IP (otherwise every user would share the proxy's single IP for rate
+// limiting) and the public URL the page should post to.
+function proxyTrusted(req, env) {
+  const secret = env.PROXY_SHARED_SECRET || "";
+  if (!secret) return false;
+  return timingSafeEqual(req.headers.get("X-Proxy-Secret") || "", secret);
+}
+
+function clientIp(req, env) {
+  if (proxyTrusted(req, env)) {
+    const real = (req.headers.get("X-Real-Client-IP") || "").trim();
+    if (real) return real;
+  }
+  return req.headers.get("CF-Connecting-IP") || "unknown";
+}
+
+// Hourly window counter in KV. Returns true when the limit is EXCEEDED.
+async function bumpRateLimit(env, key, limit) {
+  const bucket = Math.floor(Date.now() / 3600000);
+  const k = `rl:${key}:${bucket}`;
+  const current = Number((await env.OIDC_KV.get(k)) || 0);
+  if (current >= limit) return true;
+  await env.OIDC_KV.put(k, String(current + 1), { expirationTtl: 3700 });
+  return false;
+}
+
+// ---------- OIDC discovery ----------
+
+function discovery(env, url) {
+  const iss = issuerOf(env, url);
+  return {
     issuer: iss,
-    authorization_endpoint: `${iss}/authorize`,
+    // Can point at the app-domain proxy. Empty = this Worker. Base44 reads this
+    // document on every login, so switching takes effect immediately.
+    authorization_endpoint: env.PUBLIC_AUTHORIZE_URL || `${iss}/authorize`,
     token_endpoint: `${iss}/token`,
     userinfo_endpoint: `${iss}/userinfo`,
-    jwks_uri: `${iss}/jwks`,
+    jwks_uri: `${iss}/jwks.json`,
     response_types_supported: ["code"],
     grant_types_supported: ["authorization_code"],
     subject_types_supported: ["public"],
     id_token_signing_alg_values_supported: ["RS256"],
-    scopes_supported: SCOPES_SUPPORTED,
-    token_endpoint_auth_methods_supported: [
-      "client_secret_basic",
-      "client_secret_post",
-    ],
-    code_challenge_methods_supported: ["S256"],
-    claims_supported: [
-      "sub", "iss", "aud", "exp", "iat", "nonce",
-      "email", "email_verified", "name", "preferred_username", "phone_number",
-    ],
-  });
+    scopes_supported: ["openid", "email", "profile"],
+    token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+    code_challenge_methods_supported: ["S256", "plain"],
+    claims_supported: ["sub", "iss", "aud", "exp", "iat", "nonce", "email", "email_verified", "name", "phone_number"],
+  };
 }
 
-/** GET /jwks  and  /.well-known/jwks.json */
-async function handleJwks(request, env) {
-  const jwk = await publicJwkFromPrivate(env.OIDC_PRIVATE_KEY, env.OIDC_KID);
-  return json(
-    { keys: [jwk] },
-    200,
-    { "cache-control": "public, max-age=3600" }
-  );
-}
+// ---------- /authorize ----------
 
-/** GET /authorize — validate params, render login page. */
-function handleAuthorize(request, env) {
-  const url = new URL(request.url);
+async function handleAuthorize(req, env, url) {
+  const t = messages(env);
   const q = url.searchParams;
-
   const clientId = q.get("client_id");
   const redirectUri = q.get("redirect_uri");
   const responseType = q.get("response_type");
-  const scope = q.get("scope") || "openid";
-  const state = q.get("state") || "";
-  const nonce = q.get("nonce") || "";
-  const codeChallenge = q.get("code_challenge") || "";
-  const codeChallengeMethod = q.get("code_challenge_method") || "";
 
-  // Validate the client and redirect_uri BEFORE rendering anything.
-  if (!validateClientId(env, clientId)) {
-    return oauthError("invalid_client", "Unknown client_id");
-  }
-  if (!validateRedirectUri(env, redirectUri)) {
-    return oauthError("invalid_request", "redirect_uri is not allowed");
+  if (!timingSafeEqual(clientId || "", env.OIDC_CLIENT_ID)) {
+    return html(errorPage(t.badRequestTitle, t.badClient, t), 400);
   }
   if (responseType !== "code") {
-    return oauthError("unsupported_response_type", "Only response_type=code is supported");
+    return html(errorPage(t.badRequestTitle, t.badResponseType, t), 400);
   }
-  if (codeChallenge && codeChallengeMethod !== "S256") {
-    return oauthError("invalid_request", "Only code_challenge_method=S256 is supported");
-  }
-
-  // Pass the validated params into the page so they can be echoed back.
-  const params = {
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    scope,
-    state,
-    nonce,
-    code_challenge: codeChallenge,
-    code_challenge_method: codeChallengeMethod,
-  };
-  const appName = env.APP_NAME || "Phone Login";
-  return html(loginPage(params, appName));
-}
-
-/** POST /authorize/send — rate-limit, generate + store OTP, send via WhatsApp. */
-async function handleSend(request, env) {
-  const form = await request.formData();
-  const rawPhone = form.get("phone");
-  const clientId = form.get("client_id");
-
-  if (!validateClientId(env, clientId)) {
-    return oauthError("invalid_client", "Unknown client_id");
-  }
-  const phone = normalizePhone(rawPhone);
-  if (!phone) {
-    return oauthError("invalid_request", "מספר טלפון לא תקין");
+  const allowed = allowedRedirectUris(env);
+  if (!redirectUri || !allowed.includes(redirectUri)) {
+    // Never redirect to an unapproved address: that is exactly how
+    // authorization codes get stolen
+    return html(errorPage(t.badRequestTitle, t.badRedirect, t), 400);
   }
 
-  // Authorization gate: only numbers approved in Base44 may receive a code.
-  if (!(await isPhoneAuthorized(env, phone))) {
-    return oauthError(
-      "access_denied",
-      "המספר אינו מורשה להתחבר. פנה למנהל המערכת.",
-      403
-    );
-  }
-
-  // Rate limit: max RL_MAX_SENDS sends per RL_WINDOW_SECONDS per phone.
-  const rlKey = `rl:${phone}`;
-  const rlRaw = await env.OIDC_KV.get(rlKey);
-  const count = rlRaw ? parseInt(rlRaw, 10) || 0 : 0;
-  if (count >= RL_MAX_SENDS) {
-    return oauthError(
-      "too_many_requests",
-      "נשלחו יותר מדי קודים. נסה שוב בעוד מספר דקות.",
-      429
-    );
-  }
-
-  // Generate and store the OTP.
-  const code = generateOtp(6);
-  const record = {
-    code,
-    attempts: 0,
-    expiresAt: Date.now() + OTP_TTL_SECONDS * 1000,
-  };
-  await env.OIDC_KV.put(`otp:${phone}`, JSON.stringify(record), {
-    expirationTtl: OTP_TTL_SECONDS,
-  });
-
-  // Increment rate-limit counter (preserve remaining window via fresh TTL is
-  // acceptable here; a slightly generous window is fine for OTP throttling).
-  await env.OIDC_KV.put(rlKey, String(count + 1), {
-    expirationTtl: RL_WINDOW_SECONDS,
-  });
-
-  // Send via WhatsApp.
-  try {
-    await sendWhatsAppOtp(env, phone, code);
-  } catch (e) {
-    return oauthError("server_error", "שליחת הקוד נכשלה. נסה שוב מאוחר יותר.", 502);
-  }
-
-  // Masked display number, e.g. +972 *** *** 226
-  const display = toPlusForm(phone).replace(/(\+\d{3})\d+(\d{3})$/, "$1 *** *** $2");
-  return json({ ok: true, phone, display });
-}
-
-/** POST /authorize/verify — verify OTP, issue single-use auth code, return redirect. */
-async function handleVerify(request, env) {
-  const form = await request.formData();
-  const phoneRaw = form.get("phone");
-  const code = form.get("code");
-  const clientId = form.get("client_id");
-  const redirectUri = form.get("redirect_uri");
-  const state = form.get("state") || "";
-  const nonce = form.get("nonce") || "";
-  const codeChallenge = form.get("code_challenge") || "";
-
-  if (!validateClientId(env, clientId)) {
-    return oauthError("invalid_client", "Unknown client_id");
-  }
-  if (!validateRedirectUri(env, redirectUri)) {
-    return oauthError("invalid_request", "redirect_uri is not allowed");
-  }
-  const phone = normalizePhone(phoneRaw);
-  if (!phone) {
-    return oauthError("invalid_request", "מספר טלפון לא תקין");
-  }
-
-  const otpKey = `otp:${phone}`;
-  const rawRec = await env.OIDC_KV.get(otpKey);
-  if (!rawRec) {
-    return oauthError("invalid_grant", "הקוד פג תוקף. בקש קוד חדש.");
-  }
-  const rec = JSON.parse(rawRec);
-
-  if (Date.now() > rec.expiresAt) {
-    await env.OIDC_KV.delete(otpKey);
-    return oauthError("invalid_grant", "הקוד פג תוקף. בקש קוד חדש.");
-  }
-  if (rec.attempts >= MAX_OTP_VERIFY_ATTEMPTS) {
-    await env.OIDC_KV.delete(otpKey);
-    return oauthError("invalid_grant", "יותר מדי ניסיונות שגויים. בקש קוד חדש.");
-  }
-
-  if (!timingSafeEqual(String(code || ""), rec.code)) {
-    rec.attempts += 1;
-    // Keep remaining TTL roughly; recompute from expiresAt.
-    const ttl = Math.max(1, Math.ceil((rec.expiresAt - Date.now()) / 1000));
-    await env.OIDC_KV.put(otpKey, JSON.stringify(rec), { expirationTtl: ttl });
-    const left = MAX_OTP_VERIFY_ATTEMPTS - rec.attempts;
-    return oauthError("invalid_grant", `קוד שגוי. נותרו ${left} ניסיונות.`);
-  }
-
-  // Correct code — consume the OTP (single use).
-  await env.OIDC_KV.delete(otpKey);
-
-  // Issue a single-use authorization code bound to all the params.
-  const authCode = randomToken(32);
-  const codeRecord = {
-    phone,
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    nonce,
-    code_challenge: codeChallenge,
-    created: Date.now(),
-  };
-  await env.OIDC_KV.put(`authcode:${authCode}`, JSON.stringify(codeRecord), {
-    expirationTtl: CODE_TTL_SECONDS,
-  });
-
-  // Build the redirect back to Base44.
-  const redirect = new URL(redirectUri);
-  redirect.searchParams.set("code", authCode);
-  if (state) redirect.searchParams.set("state", state);
-
-  return json({ ok: true, redirect: redirect.toString() });
-}
-
-/** Extract client credentials from Authorization: Basic or form body. */
-function extractClientCreds(request, form) {
-  const auth = request.headers.get("authorization") || "";
-  if (auth.toLowerCase().startsWith("basic ")) {
-    try {
-      const decoded = atob(auth.slice(6).trim());
-      const idx = decoded.indexOf(":");
-      if (idx >= 0) {
-        return {
-          id: decodeURIComponent(decoded.slice(0, idx)),
-          secret: decodeURIComponent(decoded.slice(idx + 1)),
-        };
-      }
-    } catch (e) { /* fall through */ }
-  }
-  return {
-    id: form.get("client_id") || "",
-    secret: form.get("client_secret") || "",
-  };
-}
-
-/** POST /token — exchange auth code for id_token + access_token. */
-async function handleToken(request, env) {
-  const form = await request.formData();
-  const grantType = form.get("grant_type");
-  const code = form.get("code");
-  const redirectUri = form.get("redirect_uri");
-  const codeVerifier = form.get("code_verifier");
-
-  if (grantType !== "authorization_code") {
-    return oauthError("unsupported_grant_type", "Only authorization_code is supported");
-  }
-
-  // Client authentication.
-  const creds = extractClientCreds(request, form);
-  if (!validateClientId(env, creds.id) || !timingSafeEqual(creds.secret, env.OIDC_CLIENT_SECRET)) {
-    return oauthError("invalid_client", "Client authentication failed", 401);
-  }
-
-  if (!code) {
-    return oauthError("invalid_request", "Missing code");
-  }
-
-  // Look up + consume the auth code (single use).
-  const codeKey = `authcode:${code}`;
-  const rawCode = await env.OIDC_KV.get(codeKey);
-  if (!rawCode) {
-    return oauthError("invalid_grant", "Authorization code is invalid or expired");
-  }
-  // Delete immediately to enforce single use even on concurrent requests.
-  await env.OIDC_KV.delete(codeKey);
-  const cr = JSON.parse(rawCode);
-
-  // redirect_uri must match the one used at /authorize.
-  if (!redirectUri || redirectUri !== cr.redirect_uri) {
-    return oauthError("invalid_grant", "redirect_uri mismatch");
-  }
-  // client_id binding.
-  if (cr.client_id !== creds.id) {
-    return oauthError("invalid_grant", "client_id mismatch");
-  }
-  // PKCE.
-  const pkceOk = await verifyPkce(codeVerifier, cr.code_challenge);
-  if (!pkceOk) {
-    return oauthError("invalid_grant", "PKCE verification failed");
-  }
-
-  // Build identity claims.
-  const iss = issuerOf(request, env);
-  const phone = cr.phone;                 // E.164 digits, no +
-  const plus = toPlusForm(phone);         // +972...
-  const sub = phone;
-  // Synthetic, stable email so Base44 (which keys users by email) accepts the
-  // phone-only user. Defaults to the Worker's own host; override via env.
-  const emailDomain = env.SYNTHETIC_EMAIL_DOMAIN || new URL(iss).host;
-  const email = `${phone}@${emailDomain}`;
-  const now = Math.floor(Date.now() / 1000);
-  const exp = now + ACCESS_TOKEN_TTL_SECONDS;
-
-  const idTokenPayload = {
-    iss,
-    sub,
-    aud: creds.id,
-    iat: now,
-    exp,
-    email,
-    email_verified: true,
-    name: plus,
-    preferred_username: plus,
-    phone_number: plus,
-    phone_number_verified: true,
-  };
-  if (cr.nonce) idTokenPayload.nonce = cr.nonce;
-
-  const idToken = await signJwt(
-    { alg: "RS256", typ: "JWT", kid: env.OIDC_KID },
-    idTokenPayload,
-    env.OIDC_PRIVATE_KEY
+  const sid = randomToken(24);
+  await env.OIDC_KV.put(
+    `req:${sid}`,
+    JSON.stringify({
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      state: q.get("state") || "",
+      nonce: q.get("nonce") || "",
+      scope: q.get("scope") || "openid email",
+      code_challenge: q.get("code_challenge") || "",
+      code_challenge_method: (q.get("code_challenge_method") || "").toUpperCase(),
+    }),
+    { expirationTtl: AUTH_REQ_TTL_SEC },
   );
 
-  // Opaque access token, stored so /userinfo can resolve it.
+  // Through a trusted proxy the page must post to the proxy (same origin for
+  // the user's browser), not to this Worker
+  const proxyBase = proxyTrusted(req, env) ? (req.headers.get("X-Proxy-Base") || "").trim() : "";
+  return html(loginPage({
+    sid,
+    appName: env.APP_NAME || t.defaultAppName,
+    accent: env.BRAND_ACCENT || "#2b2724",
+    senderNote: env.LOGIN_SENDER_NOTE || "",
+    sendUrl: proxyBase ? `${proxyBase}?op=send` : "/authorize/send",
+    verifyUrl: proxyBase ? `${proxyBase}?op=verify` : "/authorize/verify",
+    t,
+    lang: String(env.LOCALE || "he").toLowerCase(),
+  }));
+}
+
+async function loadRequest(env, sid) {
+  if (!sid || typeof sid !== "string") return null;
+  const raw = await env.OIDC_KV.get(`req:${sid}`);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (_) { return null; }
+}
+
+// ---------- /authorize/send ----------
+
+async function handleSend(req, env, ctx) {
+  const t = messages(env);
+  const url = new URL(req.url);
+  const body = await req.json().catch(() => ({}));
+  const authReq = await loadRequest(env, body.sid);
+  if (!authReq) return json({ message: t.sessionExpired }, 400);
+
+  const country = env.DEFAULT_COUNTRY_CODE || "972";
+  const phone = normalizePhone(body.phone, country);
+  if (!phone || phone.length < 10) return json({ message: t.badPhone }, 400);
+
+  const ip = clientIp(req, env);
+  if (await bumpRateLimit(env, `ip:${ip}`, numEnv(env, "SEND_LIMIT_PER_IP", SEND_LIMIT_PER_IP_PER_HOUR))) {
+    return json({ message: t.tooManyIp }, 429);
+  }
+
+  const gate = await isPhoneAuthorized(env, phone);
+  if (!gate.allowed) {
+    // The same message for every reason: never reveal who is on the list
+    console.warn("ACCESS_DENIED", gate.reason);
+    return json({ message: t.denied }, 403);
+  }
+
+  if (await bumpRateLimit(env, `phone:${phone}`, numEnv(env, "SEND_LIMIT_PER_PHONE", SEND_LIMIT_PER_PHONE_PER_HOUR))) {
+    return json({ message: t.tooManyPhone }, 429);
+  }
+
+  const existingRaw = await env.OIDC_KV.get(`otp:${phone}`);
+  if (existingRaw) {
+    try {
+      const existing = JSON.parse(existingRaw);
+      const cooldown = numEnv(env, "OTP_RESEND_COOLDOWN", OTP_RESEND_COOLDOWN_SEC);
+      const since = (Date.now() - (existing.sentAt || 0)) / 1000;
+      if (since < cooldown) {
+        return json({ message: t.cooldown(Math.ceil(cooldown - since)) }, 429);
+      }
+    } catch (_) { /* corrupt record: just overwrite it */ }
+  }
+
+  const code = randomDigits(OTP_LENGTH);
+  // Only a hash is stored: a leak of the KV is not enough to impersonate anyone
+  await env.OIDC_KV.put(
+    `otp:${phone}`,
+    JSON.stringify({ hash: await sha256Hex(`${phone}:${code}`), attempts: 0, sentAt: Date.now() }),
+    { expirationTtl: OTP_TTL_SEC },
+  );
+
+  // An email this person is already linked to wins over the derived one.
+  // Without this, someone the owner registered with a real address would get a
+  // second identity under the synthetic address: a duplicate.
+  const loginEmail = gate.email || syntheticEmail(env, phone, url);
+
+  const sent = await sendOtp(env, phone, code);
+  // Optional admin-visible log (never the code itself). In the background, so
+  // it cannot delay the answer. Logged on failure too.
+  ctx.waitUntil(logLoginAttempt(env, { phone, email: loginEmail, name: gate.name || "", sent }));
+  if (!sent.ok) {
+    await env.OIDC_KV.delete(`otp:${phone}`);
+    return json({ message: t.sendFailed }, 502);
+  }
+
+  await env.OIDC_KV.put(`sid_phone:${body.sid}`, phone, { expirationTtl: AUTH_REQ_TTL_SEC });
+
+  // Provision the user now, in the background. Base44 creates the row
+  // asynchronously, and the seconds the person spends waiting for the code and
+  // typing it are a far more generous window than a synchronous wait at the
+  // moment they press "log in".
+  ctx.waitUntil(ensureBase44User(env, { email: loginEmail, authId: gate.authId || "" }));
+  if (gate.name) {
+    await env.OIDC_KV.put(`sid_name:${body.sid}`, gate.name, { expirationTtl: AUTH_REQ_TTL_SEC });
+  }
+  await env.OIDC_KV.put(`sid_email:${body.sid}`, loginEmail, { expirationTtl: AUTH_REQ_TTL_SEC });
+  if (gate.authId) {
+    await env.OIDC_KV.put(`sid_auth:${body.sid}`, gate.authId, { expirationTtl: AUTH_REQ_TTL_SEC });
+  }
+  return json({ ok: true });
+}
+
+// ---------- /authorize/verify ----------
+
+async function handleVerify(req, env, ctx) {
+  const t = messages(env);
+  const url = new URL(req.url);
+  const body = await req.json().catch(() => ({}));
+  const authReq = await loadRequest(env, body.sid);
+  if (!authReq) return json({ message: t.sessionExpired }, 400);
+
+  const phone = await env.OIDC_KV.get(`sid_phone:${body.sid}`);
+  if (!phone) return json({ message: t.noCodeSent }, 400);
+
+  const raw = await env.OIDC_KV.get(`otp:${phone}`);
+  if (!raw) return json({ message: t.codeExpired }, 400);
+
+  let rec;
+  try { rec = JSON.parse(raw); } catch (_) {
+    await env.OIDC_KV.delete(`otp:${phone}`);
+    return json({ message: t.codeExpired }, 400);
+  }
+
+  if ((rec.attempts || 0) >= OTP_MAX_ATTEMPTS) {
+    await env.OIDC_KV.delete(`otp:${phone}`);
+    return json({ message: t.tooManyAttempts }, 429);
+  }
+
+  const supplied = String(body.code || "").replace(/\D/g, "");
+  const ok = timingSafeEqual(await sha256Hex(`${phone}:${supplied}`), rec.hash);
+
+  if (!ok) {
+    rec.attempts = (rec.attempts || 0) + 1;
+    const left = Math.max(0, OTP_MAX_ATTEMPTS - rec.attempts);
+    // Keep the ORIGINAL expiry, so wrong attempts cannot extend the code's life
+    const elapsed = Math.floor((Date.now() - (rec.sentAt || Date.now())) / 1000);
+    const ttl = Math.max(1, OTP_TTL_SEC - elapsed);
+    await env.OIDC_KV.put(`otp:${phone}`, JSON.stringify(rec), { expirationTtl: ttl });
+    return json({ message: t.wrongCode(left) }, 400);
+  }
+
+  // Success: the code is burned at once, it cannot be replayed
+  await env.OIDC_KV.delete(`otp:${phone}`);
+
+  // Make sure the user row exists in Base44 BEFORE returning an authorization
+  // code. If that fails we stop here with a clear message, instead of sending
+  // the person back into Base44's generic "An error occurred during login".
+  const existingEmail = await env.OIDC_KV.get(`sid_email:${body.sid}`);
+  const email = existingEmail || syntheticEmail(env, phone, url);
+  const gateName = await env.OIDC_KV.get(`sid_name:${body.sid}`);
+  const authId = await env.OIDC_KV.get(`sid_auth:${body.sid}`);
+  const provisioned = await ensureBase44User(env, { email, authId: authId || "" });
+  if (!provisioned.ok) {
+    return json({ message: t.provisionFailed }, 502);
+  }
+
+  // Filling in the profile runs in the background; it must not delay the login
+  if (provisioned.needsProfile) {
+    ctx.waitUntil(completeUserProfile(env, { email, phone, fullName: gateName || "" }));
+  }
+
+  await env.OIDC_KV.delete(`sid_phone:${body.sid}`);
+  await env.OIDC_KV.delete(`sid_name:${body.sid}`);
+  await env.OIDC_KV.delete(`sid_email:${body.sid}`);
+  await env.OIDC_KV.delete(`sid_auth:${body.sid}`);
+  await env.OIDC_KV.delete(`req:${body.sid}`);
+
+  const authCode = randomToken(32);
+  await env.OIDC_KV.put(
+    `code:${authCode}`,
+    JSON.stringify({
+      phone,
+      nonce: authReq.nonce,
+      client_id: authReq.client_id,
+      redirect_uri: authReq.redirect_uri,
+      code_challenge: authReq.code_challenge || "",
+      code_challenge_method: authReq.code_challenge_method || "",
+      // The email chosen at verification (existing > derived). /token must use
+      // it and not derive again, or the id_token would carry a different
+      // identity from the one that was provisioned.
+      email,
+      // The name from the allowlist. It is sent as the id_token's `name` claim,
+      // which is where Base44 takes the user's full_name from (the way Google
+      // supplies a name). Without it the phone number becomes the name, and it
+      // cannot be fixed later: full_name belongs to the auth system and a User
+      // update silently ignores it.
+      name: gateName || "",
+    }),
+    { expirationTtl: AUTH_CODE_TTL_SEC },
+  );
+
+  const dest = new URL(authReq.redirect_uri);
+  dest.searchParams.set("code", authCode);
+  if (authReq.state) dest.searchParams.set("state", authReq.state);
+  return json({ redirect: dest.toString() });
+}
+
+// ---------- /token ----------
+
+function clientCredsFrom(req, form) {
+  const auth = req.headers.get("Authorization") || "";
+  if (auth.startsWith("Basic ")) {
+    try {
+      const [id, secret] = atob(auth.slice(6)).split(":");
+      return { id: decodeURIComponent(id || ""), secret: decodeURIComponent(secret || "") };
+    } catch (_) { /* fall through to the body parameters */ }
+  }
+  return { id: form.get("client_id") || "", secret: form.get("client_secret") || "" };
+}
+
+async function handleToken(req, env, url) {
+  const form = new URLSearchParams(await req.text());
+  const creds = clientCredsFrom(req, form);
+
+  if (!timingSafeEqual(creds.id, env.OIDC_CLIENT_ID) ||
+      !timingSafeEqual(creds.secret, env.OIDC_CLIENT_SECRET)) {
+    return json({ error: "invalid_client" }, 401);
+  }
+  if (form.get("grant_type") !== "authorization_code") {
+    return json({ error: "unsupported_grant_type" }, 400);
+  }
+
+  const code = form.get("code") || "";
+  const raw = await env.OIDC_KV.get(`code:${code}`);
+  if (!raw) return json({ error: "invalid_grant" }, 400);
+  // One-time: deleted before the token is issued
+  await env.OIDC_KV.delete(`code:${code}`);
+
+  let rec;
+  try { rec = JSON.parse(raw); } catch (_) { return json({ error: "invalid_grant" }, 400); }
+
+  const suppliedRedirect = form.get("redirect_uri");
+  if (suppliedRedirect && suppliedRedirect !== rec.redirect_uri) {
+    return json({ error: "invalid_grant" }, 400);
+  }
+
+  // PKCE (RFC 7636). Base44 turns it on by default. If a challenge was stored
+  // it is mandatory; otherwise a stolen authorization code could be redeemed
+  // without the verifier.
+  if (rec.code_challenge) {
+    const verifier = form.get("code_verifier") || "";
+    if (!verifier) return json({ error: "invalid_grant", error_description: "code_verifier required" }, 400);
+    const method = rec.code_challenge_method || "PLAIN";
+    let computed;
+    if (method === "S256") computed = await s256Challenge(verifier);
+    else if (method === "PLAIN") computed = verifier;
+    else return json({ error: "invalid_request", error_description: "unsupported code_challenge_method" }, 400);
+    if (!timingSafeEqual(computed, rec.code_challenge)) {
+      return json({ error: "invalid_grant", error_description: "PKCE verification failed" }, 400);
+    }
+  }
+
+  const iss = issuerOf(env, url);
+  const now = Math.floor(Date.now() / 1000);
+  const email = rec.email || syntheticEmail(env, rec.phone, url);
+
+  const claims = {
+    iss,
+    sub: rec.phone,
+    aud: env.OIDC_CLIENT_ID,
+    iat: now,
+    exp: now + ID_TOKEN_TTL_SEC,
+    email,
+    email_verified: true,
+    name: rec.name || rec.phone,
+    phone_number: `+${rec.phone}`,
+    phone_number_verified: true,
+  };
+  if (rec.nonce) claims.nonce = rec.nonce;
+
+  const idToken = await signJwt(claims, env.OIDC_PRIVATE_KEY, env.OIDC_KID);
   const accessToken = randomToken(32);
   await env.OIDC_KV.put(
     `at:${accessToken}`,
-    JSON.stringify({ phone, email, sub, name: plus, phone_number: plus }),
-    { expirationTtl: ACCESS_TOKEN_TTL_SECONDS }
+    JSON.stringify({ phone: rec.phone, email, name: rec.name || "" }),
+    { expirationTtl: ID_TOKEN_TTL_SEC },
   );
 
   return json({
     access_token: accessToken,
     token_type: "Bearer",
-    expires_in: ACCESS_TOKEN_TTL_SECONDS,
+    expires_in: ID_TOKEN_TTL_SEC,
     id_token: idToken,
-    scope: "openid profile email phone",
+    scope: "openid email",
   });
 }
 
-/** GET /userinfo — resolve Bearer access token to claims. */
-async function handleUserinfo(request, env) {
-  const auth = request.headers.get("authorization") || "";
-  if (!auth.toLowerCase().startsWith("bearer ")) {
-    return json(
-      { error: "invalid_token" },
-      401,
-      { "www-authenticate": 'Bearer error="invalid_token"' }
-    );
-  }
-  const token = auth.slice(7).trim();
-  const raw = await env.OIDC_KV.get(`at:${token}`);
-  if (!raw) {
-    return json(
-      { error: "invalid_token" },
-      401,
-      { "www-authenticate": 'Bearer error="invalid_token"' }
-    );
-  }
-  const u = JSON.parse(raw);
+async function handleUserinfo(req, env) {
+  const auth = req.headers.get("Authorization") || "";
+  if (!auth.startsWith("Bearer ")) return json({ error: "invalid_token" }, 401);
+  const raw = await env.OIDC_KV.get(`at:${auth.slice(7)}`);
+  if (!raw) return json({ error: "invalid_token" }, 401);
+  const rec = JSON.parse(raw);
   return json({
-    sub: u.sub,
-    email: u.email,
+    sub: rec.phone,
+    email: rec.email,
     email_verified: true,
-    name: u.name,
-    preferred_username: u.name,
-    phone_number: u.phone_number,
-    phone_number_verified: true,
+    name: rec.name || rec.phone,
+    phone_number: `+${rec.phone}`,
   });
 }
-
-// ---------------------------------------------------------------------------
-// Router
-// ---------------------------------------------------------------------------
 
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const { pathname } = url;
-    const method = request.method.toUpperCase();
+  async fetch(req, env, ctx) {
+    const url = new URL(req.url);
+    const p = url.pathname.replace(/\/$/, "") || "/";
 
     try {
-      if (method === "GET" && pathname === "/.well-known/openid-configuration") {
-        return handleDiscovery(request, env);
+      if (req.method === "GET" && p === "/.well-known/openid-configuration") {
+        return json(discovery(env, url));
       }
-      if (method === "GET" && (pathname === "/jwks" || pathname === "/.well-known/jwks.json")) {
-        return handleJwks(request, env);
+      if (req.method === "GET" && p === "/jwks.json") {
+        return json({ keys: [JSON.parse(env.OIDC_PUBLIC_JWK)] });
       }
-      if (method === "GET" && pathname === "/authorize") {
-        return handleAuthorize(request, env);
+      if (req.method === "GET" && p === "/health") {
+        return json({ ok: true, issuer: issuerOf(env, url) });
       }
-      if (method === "POST" && pathname === "/authorize/send") {
-        return handleSend(request, env);
-      }
-      if (method === "POST" && pathname === "/authorize/verify") {
-        return handleVerify(request, env);
-      }
-      if (method === "POST" && pathname === "/token") {
-        return handleToken(request, env);
-      }
-      if (method === "GET" && pathname === "/userinfo") {
-        return handleUserinfo(request, env);
-      }
-      if (method === "GET" && pathname === "/") {
-        return new Response("MeetVault Phone OIDC Provider — see /.well-known/openid-configuration", {
-          status: 200,
-          headers: { "content-type": "text/plain;charset=UTF-8" },
-        });
-      }
-      return new Response("Not found", { status: 404 });
-    } catch (err) {
-      return json({ error: "server_error", error_description: String(err && err.message || err) }, 500);
+      if (req.method === "GET" && p === "/authorize") return handleAuthorize(req, env, url);
+      if (req.method === "POST" && p === "/authorize/send") return handleSend(req, env, ctx);
+      if (req.method === "POST" && p === "/authorize/verify") return handleVerify(req, env, ctx);
+      if (req.method === "POST" && p === "/token") return handleToken(req, env, url);
+      if (p === "/userinfo") return handleUserinfo(req, env);
+
+      return json({ error: "not_found" }, 404);
+    } catch (e) {
+      console.error("UNHANDLED", p, String((e && e.stack) || e));
+      return json({ error: "server_error" }, 500);
     }
   },
 };

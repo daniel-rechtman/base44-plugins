@@ -1,17 +1,19 @@
 {
-  "name": "phone-oidc",
-  "version": "1.0.0",
+  "name": "base44-phone-sso",
+  "version": "2.0.0",
   "private": true,
-  "description": "Self-hosted OpenID Connect provider on Cloudflare Workers. Authenticates users by phone number with an OTP delivered over WhatsApp via the Green API. For use as a Base44 Advanced/Manual SSO (OIDC) provider.",
   "type": "module",
+  "description": "Self-hosted OIDC provider on Cloudflare Workers for Base44 phone login. One-time code on WhatsApp via Green API or Meta's Cloud API, with provider failover.",
   "main": "src/index.js",
   "scripts": {
+    "keygen": "node scripts/keygen.mjs",
+    "check": "for f in src/*.js; do node --check \"$f\" || exit 1; done",
+    "test": "bash test/run.sh",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "keygen": "node scripts/generate-keys.mjs",
-    "check": "node --check src/index.js"
+    "tail": "wrangler tail"
   },
   "devDependencies": {
-    "wrangler": "^3.90.0"
+    "wrangler": "^4.0.0"
   }
 }

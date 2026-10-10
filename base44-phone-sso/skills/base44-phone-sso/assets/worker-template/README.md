@@ -1,100 +1,79 @@
-# Phone OIDC Provider (Cloudflare Worker)
+# Phone login for Base44: the identity provider (Cloudflare Worker)
 
-A self-hosted **OpenID Connect** Identity Provider on a single Cloudflare Worker.
-Users sign in with their **phone number**; a 6-digit OTP is delivered over
-**WhatsApp** via the **Green API**. The phone number *is* the user identity.
+A small OIDC provider. It verifies a phone number with a one-time code sent on
+WhatsApp and returns a stable email for that phone, so "log in with your phone"
+works on a Base44 app whose SSO only accepts standard OIDC providers and keys
+every user by email.
 
-Plug it into a Base44 app as an **Advanced / Manual SSO (OIDC)** provider.
+## Files
 
-```
-GET  /.well-known/openid-configuration   discovery
-GET  /authorize                          RTL Hebrew phone + OTP login UI
-POST /authorize/send                     (internal) send OTP over WhatsApp
-POST /authorize/verify                   (internal) verify OTP, issue auth code
-POST /token                              code -> id_token (RS256) + access_token
-GET  /userinfo                           Bearer access_token -> claims
-GET  /jwks   /.well-known/jwks.json      public RSA JWK
-```
+| File | Role |
+|---|---|
+| `src/index.js` | Router: discovery, jwks, authorize, send, verify, token, userinfo |
+| `src/otp.js` | Picks the delivery provider and falls back when it fails |
+| `src/green.js` | Delivery through Green API (plain text), several instances in order |
+| `src/meta.js` | Delivery through Meta's Cloud API (AUTHENTICATION template), direct or through a relay |
+| `src/allowlist.js` | Who may log in: reads the allowlist entity in the Base44 app |
+| `src/provision.js` | Makes sure the Base44 user exists; optional login log |
+| `src/phone.js` | Phone normalization (every typed format -> one string) |
+| `src/crypto.js` | RS256 signing, hashing, constant-time compare, unbiased random digits, PKCE |
+| `src/page.js` | The login page (no dependencies, no secrets) |
+| `src/messages.js` | Every user-facing string (`LOCALE` = `he` or `en`) |
+| `scripts/keygen.mjs` | Generates the key pair + client credentials, fills `wrangler.toml` |
+| `test/` | Fake services + an end-to-end suite. No accounts needed |
 
-## Why a synthetic email?
-Base44 keys users by **email**, but phone-only users have none. So `/token`
-issues a **stable synthetic email** `<phone>@<domain>` with `email_verified:true`.
-Same phone always maps to the same email, so it is always the same Base44 user.
+## Setup
 
-## Phone allowlist (managed inside Base44)
-Before sending an OTP, the Worker checks the Base44 `AuthorizedPhone` entity. Only
-**approved** numbers receive a code; everyone else is rejected. Matching is
-format-tolerant (it normalizes both sides), so `0501234567`, `501234567`,
-`+972501234567` and `972501234567` are treated as the same number.
-
----
-
-## Setup (Claude usually drives these via the skill)
-
-### 1. Install + log in
-```powershell
+```bash
 npm install
-npx wrangler login          # opens the browser once; approve in Cloudflare
+npm run keygen                         # writes KEYS.local.json, fills wrangler.toml
+npm test                               # 4 suites against fake services
+npx wrangler login
+npx wrangler kv namespace create OIDC_KV   # paste the id into wrangler.toml
 ```
 
-### 2. Create the KV namespace
-```powershell
-npx wrangler kv namespace create OIDC_KV
-```
-Paste the printed `id` into `wrangler.toml` (replace `__KV_NAMESPACE_ID__`).
+Fill the remaining placeholders in `wrangler.toml` (`__BASE44_APP_ID__`,
+`__SYNTHETIC_EMAIL_DOMAIN__`) and choose `OTP_PROVIDER`.
 
-### 3. Generate keys + client credentials
-```powershell
-npm run keygen
-```
-Writes `KEYS.local.json` (RSA private key, public JWK, `OIDC_KID`,
-`OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`). Put the printed `OIDC_KID` into
-`wrangler.toml` (replace `__OIDC_KID__`). **Never commit `KEYS.local.json`.**
+Secrets are set one by one and never printed. Pipe them from the local files:
 
-### 4. Fill `wrangler.toml`
-Replace `__BASE44_APP_ID__` with your Base44 app id and set `APP_NAME`.
-
-### 5. Set the secrets
-```powershell
-npx wrangler secret put GREEN_API_ID         # from secrets.json
-npx wrangler secret put GREEN_API_TOKEN      # from secrets.json
-npx wrangler secret put BASE44_API_KEY       # from secrets.json
-npx wrangler secret put OIDC_CLIENT_ID       # from KEYS.local.json
-npx wrangler secret put OIDC_CLIENT_SECRET   # from KEYS.local.json
-npx wrangler secret put OIDC_PRIVATE_KEY     # the full PEM from KEYS.local.json
-```
-
-### 6. Deploy + enable the public URL
-```powershell
+```bash
+node -e 'process.stdout.write(require("./KEYS.local.json").OIDC_CLIENT_SECRET)' | npx wrangler secret put OIDC_CLIENT_SECRET
+node -e 'process.stdout.write(require("./KEYS.local.json").OIDC_PRIVATE_KEY)'   | npx wrangler secret put OIDC_PRIVATE_KEY
+node -e 'process.stdout.write(require("./secrets.json").BASE44_API_KEY)'        | npx wrangler secret put BASE44_API_KEY
+# plus the provider secrets you use: GREEN_API_ID, GREEN_API_TOKEN, ...
 npx wrangler deploy
 ```
-Then in the Cloudflare dashboard: Workers & Pages -> your Worker -> **Domains** ->
-enable the **Worker URL** (workers.dev). Note the URL, e.g.
-`https://phone-oidc.<subdomain>.workers.dev`.
 
-### 7. Connect to Base44 (Advanced / Manual SSO)
-| Field | Value |
-|-------|-------|
-| Discovery URL | `https://<your-worker>.workers.dev/.well-known/openid-configuration` |
-| Client ID | `OIDC_CLIENT_ID` from `KEYS.local.json` |
-| Client Secret | `OIDC_CLIENT_SECRET` from `KEYS.local.json` |
-| Scope | `openid email profile` |
-| Redirect URI (auto) | `https://app.base44.com/api/apps/<app id>/auth/sso/callback` |
+Health check: `curl https://<worker>.workers.dev/.well-known/openid-configuration`
 
-### 8. Test
-Open the app login, choose the SSO provider, enter an **approved** phone, get the
-OTP on WhatsApp, type it, get signed in. An unapproved number is rejected.
+## Before the gate goes live
 
----
+**Add the owner's own number to the allowlist first.** From the moment the
+Worker is connected, only numbers on the list can log in, the owner included.
 
-## Security model
-- No secrets in the frontend. The login page only carries public OAuth params.
-- OTP: 6 digits, single-use, 5-min expiry, max 5 wrong attempts, 5 sends / 15 min.
-- Auth codes: single-use, 5-min TTL, bound to client + redirect + nonce + PKCE.
-- Tokens signed RS256; the private key lives only as a Worker secret.
-- Only the one configured `client_id` and `redirect_uri` are accepted.
+## Security decisions
 
-## Regenerating keys
-`npm run keygen` writes a fresh `KEYS.local.json`. After it, update `OIDC_KID` in
-`wrangler.toml`, re-run the changed `wrangler secret put` commands, and re-enter
-the new client id/secret in Base44.
+- **The OIDC request lives on the server.** The browser only gets a one-time
+  `sid`. `redirect_uri` and `client_id` are never read back from a POST, so a
+  browser cannot divert an authorization code.
+- **`redirect_uri` is checked against a closed list** (`ALLOWED_REDIRECT_URIS`).
+- **The code is stored hashed** (`sha256(phone:code)`). A KV leak is not enough
+  to impersonate anyone.
+- **The gate fails closed.** A network error talking to Base44 means "not allowed".
+- **One denial message for every reason.** It does not reveal who is on the list.
+- **One-time everything.** The OTP is deleted on success; the authorization
+  code is deleted before the token is issued.
+- **Wrong attempts do not extend a code's life** (the original expiry is kept).
+- **PKCE is enforced** whenever Base44 sent a challenge.
+- **Limits:** codes per phone per hour, codes per IP per hour, a resend
+  cooldown, 5 attempts per code. All tunable in `wrangler.toml`.
+- **No secrets in the browser.** The login page carries only the `sid`.
+- **The code is never logged**, not by the Worker, not by the relay, not by the
+  optional login log.
+
+## Logs
+
+`npx wrangler tail` shows live logs. Useful markers: `ACCESS_DENIED`,
+`OTP_PROVIDER_FAILED`, `OTP_PROVIDER_FALLBACK`, `GREEN_FALLBACK_USED`,
+`META_SEND_FAILED`, `USER_INVITED`, `USER_EXISTS`, `USER_PROVISION_FAILED`.
