@@ -11,8 +11,8 @@
     {
       "name": "base44-phone-sso",
       "source": "./base44-phone-sso",
-      "description": "Set up phone-number login (WhatsApp OTP via Green API) for a Base44 app, end-to-end. Deploys a self-hosted OIDC provider on Cloudflare, connects it to Base44 SSO, and adds an in-app allowlist of approved numbers.",
-      "version": "1.0.0"
+      "description": "Set up phone-number login (a one-time code on WhatsApp) for a Base44 app, end to end. Deploys a self-hosted OIDC provider on Cloudflare, connects it to Base44 SSO, adds an in-app allowlist, and delivers the code through Green API or Meta's Cloud API with automatic failover.",
+      "version": "2.0.0"
     }
   ]
 }

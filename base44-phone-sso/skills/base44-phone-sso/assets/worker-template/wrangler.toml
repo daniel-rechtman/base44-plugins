@@ -1,42 +1,97 @@
-name = "phone-oidc"
+name = "phone-sso"
 main = "src/index.js"
-compatibility_date = "2025-05-01"
+compatibility_date = "2026-08-01"
 
 # ---------------------------------------------------------------------------
-# KV namespace. A single namespace is used with key prefixes:
-#   otp:<phone>      OTP records         (TTL 300s)
-#   authcode:<code>  authorization codes (TTL 300s)
-#   at:<token>       access tokens       (TTL 3600s)
-#   rl:<phone>       OTP send rate limit (TTL 900s)
-# Create it with:  wrangler kv namespace create OIDC_KV
-# then paste the printed "id" below.
+# KV namespace. One namespace, key prefixes:
+#   req:<sid>       the OIDC request, server-side      (15 min)
+#   otp:<phone>     hashed one-time code + attempts    (5 min)
+#   sid_*:<sid>     phone / name / email for this sid  (15 min)
+#   code:<code>     authorization codes                (2 min)
+#   at:<token>      access tokens                      (1 h)
+#   rl:<key>:<hour> rate-limit counters                (1 h)
+# Create it with:  npx wrangler kv namespace create OIDC_KV
+# and paste the printed id below.
 # ---------------------------------------------------------------------------
 [[kv_namespaces]]
 binding = "OIDC_KV"
 id = "__KV_NAMESPACE_ID__"
 
 # ---------------------------------------------------------------------------
-# Non-secret config (safe to commit). Secrets (GREEN_API_TOKEN,
-# OIDC_PRIVATE_KEY, OIDC_CLIENT_SECRET, GREEN_API_ID, OIDC_CLIENT_ID,
-# BASE44_API_KEY) are set via `wrangler secret put` and never appear here.
+# Non-secret config. Secrets are set with `npx wrangler secret put` and never
+# appear in this file. See the list at the bottom.
 # ---------------------------------------------------------------------------
 [vars]
-# Must match the published JWK. Printed by `npm run keygen` and stored in KEYS.local.json.
-OIDC_KID = "__OIDC_KID__"
+# ---- branding / language ----
+APP_NAME = "My App"                 # shown on the login page and in the WhatsApp text
+BRAND_ACCENT = "#2b2724"            # focus + spinner color on the login page
+LOCALE = "he"                       # "he" or "en" (src/messages.js)
+DEFAULT_COUNTRY_CODE = "972"        # numbers typed in local format get this prefix
+# Optional line under the form, e.g. "The code is sent on WhatsApp from <business name>."
+LOGIN_SENDER_NOTE = ""
 
-# The ONE redirect_uri the Worker will accept. It is your Base44 app's SSO callback:
-#   https://app.base44.com/api/apps/<YOUR_BASE44_APP_ID>/auth/sso/callback
-ALLOWED_REDIRECT_URI = "https://app.base44.com/api/apps/__BASE44_APP_ID__/auth/sso/callback"
-
-# Your Base44 app id (used to read the AuthorizedPhone allowlist entity).
+# ---- Base44 ----
 BASE44_APP_ID = "__BASE44_APP_ID__"
+# Exact redirect URI(s) Base44 shows on its SSO screen, comma separated.
+ALLOWED_REDIRECT_URIS = "https://app.base44.com/api/apps/__BASE44_APP_ID__/auth/sso/callback"
+# The domain of the derived email <phone>@<domain>. Users never see it.
+# It must LOOK like a real domain (".local" / ".invalid" are rejected by email
+# validation). A good choice: phone.<your-app>.base44.app
+# !! Changing this later changes the identity of EVERY user. Set once. !!
+# Upgrading from version 1 without this var? Use the old Worker's host name here.
+SYNTHETIC_EMAIL_DOMAIN = "__SYNTHETIC_EMAIL_DOMAIN__"
+ALLOWLIST_ENTITY = "AuthorizedPhone"
+# "1" (default): the Worker makes sure the Base44 user exists before returning.
+# Needed for public apps, where "Auto-admit SSO users" is locked. "0" to skip.
+PROVISION_USERS = "1"
+# Optional: name of an entity that gets one row per code sent (never the code).
+LOGIN_LOG_ENTITY = ""
 
-# Shown on the login screen and inside the WhatsApp OTP message.
-APP_NAME = "My App"
+# ---- OTP delivery ----
+# "green" = Green API, plain WhatsApp text. No template, no business verification.
+# "meta"  = Meta WhatsApp Cloud API, AUTHENTICATION template, official number.
+OTP_PROVIDER = "green"
+OTP_FALLBACK_GREEN = "1"            # meta primary -> fall back to Green when it is configured
+OTP_FALLBACK_META = "0"             # green primary -> fall back to Meta (needs an approved template)
+OTP_BUSINESS_NAME = ""              # name inside the Green text; defaults to APP_NAME
 
-# Optional. The synthetic email domain handed to Base44 (users never see it).
-# Defaults to the Worker's own host, which is stable per deployment.
-# SYNTHETIC_EMAIL_DOMAIN = "phone.example.com"
+# Meta only. Leave empty when using Green alone.
+META_TEMPLATE_NAME = "login_code"
+META_TEMPLATE_LANG = "he"
+META_GRAPH_VERSION = "v22.0"
+# "url" = one-tap / copy-code button. If Meta answers with a button parameter
+# error, try "copy_code", then "none".
+META_OTP_BUTTON_TYPE = "url"
+META_PHONE_NUMBER_ID = ""           # direct sending from the Worker (with secret META_TOKEN)
+# Send through a Base44 backend function that already holds the WhatsApp token
+# (assets/base44-functions/sendLoginOtp). When set, it is used instead of
+# META_TOKEN. Requires secret LOGIN_OTP_RELAY_SECRET on both sides.
+META_RELAY_URL = ""
 
-# Optional. Only set if you put a custom domain in front of the Worker.
-# ISSUER = "https://auth.example.com"
+# ---- limits (per hour) ----
+SEND_LIMIT_PER_PHONE = "5"
+SEND_LIMIT_PER_IP = "20"
+OTP_RESEND_COOLDOWN = "45"          # seconds
+
+# ---- app-domain proxy (optional) ----
+# Serve the login page from the app's own domain instead of *.workers.dev,
+# which filtered networks often block. Empty = the Worker serves it directly.
+# Example: https://<app-domain>/api/apps/<app id>/functions/phoneLogin
+# Rollback = empty this and deploy. Requires secret PROXY_SHARED_SECRET.
+PUBLIC_AUTHORIZE_URL = ""
+
+# ---- OIDC identity (filled in by `npm run keygen`) ----
+# The client id is public by the OAuth standard, so it is a var and not a secret.
+OIDC_CLIENT_ID = "__OIDC_CLIENT_ID__"
+OIDC_KID = "__OIDC_KID__"
+OIDC_PUBLIC_JWK = '__OIDC_PUBLIC_JWK__'
+
+# ---------------------------------------------------------------------------
+# Secrets (npx wrangler secret put <NAME>). Never in this file, never in git.
+#   always:         BASE44_API_KEY, OIDC_CLIENT_SECRET, OIDC_PRIVATE_KEY
+#   Green API:      GREEN_API_ID, GREEN_API_TOKEN
+#   Green backup:   GREEN_API_ID_2, GREEN_API_TOKEN_2   (up to _5)
+#   Meta direct:    META_TOKEN
+#   Meta relay:     LOGIN_OTP_RELAY_SECRET
+#   app proxy:      PROXY_SHARED_SECRET
+# ---------------------------------------------------------------------------

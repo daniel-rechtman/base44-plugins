@@ -1,10 +1,21 @@
 {
   "name": "base44-phone-sso",
-  "description": "Phone-number login (WhatsApp OTP via Green API) for Base44 apps. Self-hosted OIDC provider on Cloudflare + Base44 Advanced/Manual SSO + an in-app allowlist of approved phone numbers.",
-  "version": "1.0.0",
+  "description": "Phone-number login (a one-time code on WhatsApp) for Base44 apps. Self-hosted OIDC provider on Cloudflare + Base44 Advanced/Manual SSO + an in-app allowlist. Delivery through Green API or Meta's WhatsApp Cloud API with automatic failover, an app-domain login page for filtered networks, and automatic user provisioning for public apps.",
+  "version": "2.0.0",
   "author": {
     "name": "Daniel Rechtman",
     "url": "https://github.com/daniel-rechtman"
   },
-  "keywords": ["base44", "sso", "oidc", "phone", "otp", "whatsapp", "green-api", "cloudflare"]
+  "keywords": [
+    "base44",
+    "sso",
+    "oidc",
+    "phone",
+    "otp",
+    "whatsapp",
+    "green-api",
+    "meta-cloud-api",
+    "cloudflare",
+    "failover"
+  ]
 }
